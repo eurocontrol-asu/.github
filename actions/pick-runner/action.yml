@@ -2,7 +2,7 @@ name: Pick runner
 description: >
   Select a self-hosted runner label set if a matching org runner is online,
   otherwise fall back to a GitHub-hosted runner. Use it in a small "pick" job
-  and feed its output to `runs-on: ${{ fromJSON(needs.pick.outputs.runs-on) }}`.
+  and feed its `runs-on` output to the job's runs-on through fromJSON (see README).
 
 inputs:
   label:
@@ -21,7 +21,7 @@ inputs:
       instead of falling back (keeps GPU validation instead of skipping it).
     default: "false"
   client-id:
-    description: Client ID of the org GitHub App with "Self-hosted runners: Read-only".
+    description: 'Client ID of the org GitHub App with "Self-hosted runners: Read-only".'
     default: ""
   private-key:
     description: >
