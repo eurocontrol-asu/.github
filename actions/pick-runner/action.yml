@@ -1,0 +1,94 @@
+name: Pick runner
+description: >
+  Select a self-hosted runner label set if a matching org runner is online,
+  otherwise fall back to a GitHub-hosted runner. Use it in a small "pick" job
+  and feed its output to `runs-on: ${{ fromJSON(needs.pick.outputs.runs-on) }}`.
+
+inputs:
+  label:
+    description: Self-hosted runner label to look for (e.g. `ubbla`).
+    required: true
+  fallback:
+    description: GitHub-hosted runner label used when no matching runner is available.
+    default: ubuntu-latest
+  wait-minutes:
+    description: How long to wait for a matching runner to come online before falling back.
+    default: "5"
+  require-idle:
+    description: >
+      "true" = only pick the self-hosted runner if one is online AND idle.
+      "false" (default) = online is enough; the job queues behind running jobs
+      instead of falling back (keeps GPU validation instead of skipping it).
+    default: "false"
+  client-id:
+    description: Client ID of the org GitHub App with "Self-hosted runners: Read-only".
+    default: ""
+  private-key:
+    description: >
+      Private key of that GitHub App. Empty (e.g. pull requests from forks, which
+      receive no secrets) => immediate fallback, never routed to self-hosted.
+    default: ""
+
+outputs:
+  runs-on:
+    description: JSON value for `runs-on` (`["self-hosted","<label>"]` or `"<fallback>"`).
+    value: ${{ steps.pick.outputs.runs-on }}
+  selected:
+    description: "`self-hosted` or `fallback`."
+    value: ${{ steps.pick.outputs.selected }}
+
+runs:
+  using: composite
+  steps:
+    - name: Mint a read-only token
+      id: token
+      if: inputs.client-id != '' && inputs.private-key != ''
+      continue-on-error: true
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      with:
+        client-id: ${{ inputs.client-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: ${{ github.repository_owner }}
+        permission-organization-self-hosted-runners: read
+
+    - name: Pick
+      id: pick
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.token }}
+        ORG: ${{ github.repository_owner }}
+        LABEL: ${{ inputs.label }}
+        FALLBACK: ${{ inputs.fallback }}
+        WAIT_MINUTES: ${{ inputs.wait-minutes }}
+        REQUIRE_IDLE: ${{ inputs.require-idle }}
+      run: |
+        set -uo pipefail
+        selfhosted=$(jq -cn --arg l "$LABEL" '["self-hosted", $l]')
+        fallback=$(jq -cn --arg f "$FALLBACK" '$f')
+        choose() {  # $1 = self-hosted|fallback, $2 = reason
+          if [ "$1" = self-hosted ]; then out=$selfhosted; else out=$fallback; fi
+          echo "runs-on=$out" >> "$GITHUB_OUTPUT"
+          echo "selected=$1" >> "$GITHUB_OUTPUT"
+          if [ "$1" = fallback ]; then
+            echo "::warning title=Runner fallback::$2 -> running on '$FALLBACK'. Jobs that need '$LABEL' hardware (e.g. GPU tests) will be skipped or degraded."
+          else
+            echo "::notice title=Runner selected::$2 -> running on [self-hosted, $LABEL]."
+          fi
+          echo "### Runner: \`$out\` ($1)" >> "$GITHUB_STEP_SUMMARY"
+          echo "$2" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        }
+        [ -n "$GH_TOKEN" ] || choose fallback "No runner-status credentials (secret absent, e.g. fork PR, or token minting failed)"
+        filter='.runners[] | select(.status == "online") | select([.labels[].name] | index($l))'
+        [ "$REQUIRE_IDLE" = true ] && filter="$filter | select(.busy | not)"
+        deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
+        while :; do
+          if json=$(gh api --paginate "orgs/$ORG/actions/runners?per_page=100" 2>/tmp/pick-err); then
+            n=$(jq -r --arg l "$LABEL" "$filter | .name" <<<"$json" | wc -l)
+            [ "$n" -gt 0 ] && choose self-hosted "$n matching '$LABEL' runner(s) available"
+          else
+            choose fallback "Runner API error: $(head -c 300 /tmp/pick-err)"
+          fi
+          [ "$(date +%s)" -ge "$deadline" ] && choose fallback "No '$LABEL' runner available after ${WAIT_MINUTES} min"
+          sleep 30
+        done
